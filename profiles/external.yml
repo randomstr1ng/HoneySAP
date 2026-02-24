@@ -47,10 +47,10 @@ services:
         router_version_patch: 4
 
         # Password for information requests. If present it will be required
-        info_password: Passw0rd
+        #info_password: Passw0rd
 
         # Wether the external administration would be enabled on this SAP Router
-        external_admin: false
+        external_admin: true
 
         # Route table file
         route_table: !include external_route_table.yml

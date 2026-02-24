@@ -27,11 +27,9 @@ from .logger import Loggeable
 from .loader import ClassLoader
 
 
-class BaseService(Loggeable):
+class BaseService(Loggeable, metaclass=ABCMeta):
     """ Base service class
     """
-
-    __metaclass__ = ABCMeta
 
     @property
     def alias(self):

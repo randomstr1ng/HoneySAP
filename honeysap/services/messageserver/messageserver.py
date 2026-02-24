@@ -17,8 +17,8 @@
 
 # Standard imports
 from socket import timeout
-from SocketServer import ThreadingMixIn
-from BaseHTTPServer import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
+from http.server import HTTPServer, BaseHTTPRequestHandler
 # External imports
 from pysap import SAPMS
 from pysap.SAPNI import SAPNIServerThreaded, SAPNIServerHandler, SAPNIClient
@@ -80,7 +80,7 @@ class SAPMSHTTPServerHandler(Loggeable, BaseHTTPRequestHandler):
         self.request_version = version = self.default_request_version
         self.close_connection = 1
         requestline = self.raw_requestline
-        requestline = requestline.rstrip('\r\n')
+        requestline = requestline.decode('iso-8859-1').rstrip('\r\n')
         self.requestline = requestline
         words = requestline.split()
         if len(words) == 3:
@@ -116,7 +116,8 @@ class SAPMSHTTPServerHandler(Loggeable, BaseHTTPRequestHandler):
         self.command, self.path, self.request_version = command, path, version
 
         # Examine the headers and look for a Connection directive
-        self.headers = self.MessageClass(self.rfile, 0)
+        from http.client import parse_headers
+        self.headers = parse_headers(self.rfile)
 
         conntype = self.headers.get('Connection', "")
         if conntype.lower() == 'close':
@@ -180,7 +181,7 @@ The document has moved <A HREF="%s"> here</A>
 </BODY></HTML>
 """ % (url)
 
-        self.wfile.write("%s 301 MOVED PERMANENTLY\n" % http_version)
+        self.wfile.write(("%s 301 MOVED PERMANENTLY\n" % http_version).encode())
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", len(body))
         self.send_header("location", url)
@@ -189,7 +190,7 @@ The document has moved <A HREF="%s"> here</A>
         if min_version >= 1:
             self.send_header("connection", "close")
         self.end_headers()
-        self.wfile.write(body)
+        self.wfile.write(body.encode())
 
     def do_request(self):
         if self.path.startswith("/msgserver"):
