@@ -460,6 +460,9 @@ class SAPRouterServerHandler(Loggeable, SAPNIServerHandler):
         self.session.add_event("Returned information request", data={"packet": "routtab"},
                                response=str(info_pkt))
 
+        # Send a zero-length NI packet as end-of-data terminator
+        self.request.send(Raw(b""))
+
         # Signal the handler loop to stop; finish() will close the socket
         # gracefully so the client receives a proper FIN instead of RST
         self.close()
@@ -517,3 +520,29 @@ class SAPRouterService(BaseTCPService):
         # Generates a random pid and records the time when the service started
         self.server.pid = self.server.config.get("pid", 0)
         self.server.time_started = self.server.config.get("time_started", datetime.today())
+
+        # Register virtual services from the route table as synthetic clients
+        # so they appear in info responses, mimicking a real SAP Router that
+        # shows its backend connections in the connection table.
+        self._register_virtual_clients()
+
+    def _register_virtual_clients(self):
+        """Register synthetic client entries for allowed targets in the route
+        table, so they appear in the router's info response as connected
+        backend services."""
+        if not hasattr(self.server.route_table, 'table'):
+            return
+        for (host, port), (action, talk_mode, password) in self.server.route_table.table.items():
+            if action != RouteTable.ROUTE_ALLOW:
+                continue
+            self.server.clients_count += 1
+            client_key = (host, port)
+            client = SAPRouterClient()
+            client.id = self.server.clients_count
+            client.address = self.listener_address
+            client.partner = host
+            client.service = str(port)
+            client.routed = True
+            client.connected = True
+            client.connected_on = self.server.time_started
+            self.server.clients[client_key] = client
