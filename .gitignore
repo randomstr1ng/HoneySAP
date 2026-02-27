@@ -64,3 +64,4 @@ target/
 .pydevproject
 .settings
 .claude
+.DS_Store
