@@ -20,7 +20,7 @@ from socket import timeout
 from socketserver import ThreadingMixIn
 from http.server import HTTPServer, BaseHTTPRequestHandler
 # External imports
-from pysap import SAPMS
+from pysap.SAPMS import SAPMS
 from pysap.SAPNI import SAPNIServerThreaded, SAPNIServerHandler, SAPNIClient
 # Custom imports
 from honeysap.core.logger import Loggeable
@@ -35,14 +35,46 @@ class SAPMSServerHandler(Loggeable, SAPNIServerHandler):
 
     def __init__(self, request, client_address, server):
         Loggeable.__init__(self)
+        self.config = server.config
+        client_ip, client_port = client_address
+        server_ip, server_port = server.server_address
+        self.session = server.session_manager.get_session("message_server",
+                                                          client_ip,
+                                                          client_port,
+                                                          server_ip,
+                                                          server_port)
         SAPNIServerHandler.__init__(self, request, client_address, server)
 
     def handle_data(self):
-        self.packet.show()
         try:
             if SAPMS not in self.packet:
+                self.session.add_event("Invalid packet received",
+                                       data={"client": str(self.client_address)})
                 self.logger.debug("Invalid packet sent to SAPMS")
                 self.request.send(SAPMS())
+                return
+
+            ms = self.packet[SAPMS]
+            flag = getattr(ms, "flag", None)
+            iflag = getattr(ms, "iflag", None)
+            opcode = getattr(ms, "opcode", None)
+            fromname = getattr(ms, "fromname", "").strip()
+            toname = getattr(ms, "toname", "").strip()
+
+            data = {
+                "client": str(self.client_address),
+                "flag": flag,
+                "iflag": iflag,
+                "fromname": fromname,
+                "toname": toname,
+            }
+            if opcode is not None:
+                data["opcode"] = opcode
+
+            self.session.add_event("MS packet received",
+                                   data=data,
+                                   request=str(self.packet))
+
         except timeout:
             self.logger.debug("Timeout connection from %s", self.client_address)
 
@@ -67,6 +99,13 @@ class SAPMSHTTPServerHandler(Loggeable, BaseHTTPRequestHandler):
 
     def __init__(self, request, client_address, server):
         Loggeable.__init__(self)
+        client_ip, client_port = client_address
+        server_ip, server_port = server.server_address
+        self.session = server.session_manager.get_session("message_server_http",
+                                                          client_ip,
+                                                          client_port,
+                                                          server_ip,
+                                                          server_port)
         BaseHTTPRequestHandler.__init__(self, request, client_address, server)
 
     def log_message(self, fmt, *args):
@@ -160,7 +199,11 @@ class SAPMSHTTPServerHandler(Loggeable, BaseHTTPRequestHandler):
     def build_301_to_icm(self):
         """Build a redirection to the ICM service"""
         hostname = self.server.config.get("hostname", self.default_hostname)
-        icm_port = self.server.config.config_for("SAPICMService")[0].get("listener_port", 8000)
+        try:
+            icm_configs = self.server.config.config_for("services", "service", "SAPICMService")
+            icm_port = icm_configs[0].get("listener_port", 8000)
+        except (IndexError, AttributeError):
+            icm_port = 8000
         url = "http://%s:%d%s" % (hostname,
                                   icm_port,
                                   self.path)
@@ -193,10 +236,22 @@ The document has moved <A HREF="%s"> here</A>
         self.wfile.write(body.encode())
 
     def do_request(self):
+        data = {
+            "client": str(self.client_address),
+            "method": self.command,
+            "path": self.path,
+            "user_agent": self.headers.get("User-Agent", ""),
+            "host": self.headers.get("Host", ""),
+        }
+
         if self.path.startswith("/msgserver"):
+            self.session.add_event("MS HTTP request to msgserver",
+                                   data=data)
             self.logger.debug("Received request to msgserver endpoint")
             self.do_request_msgserver()
         else:
+            self.session.add_event("MS HTTP request redirected to ICM",
+                                   data=data)
             self.logger.debug("Redirecting to ICM service")
             self.build_301_to_icm()
 
