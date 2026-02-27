@@ -171,7 +171,7 @@ class BaseHTTPService(BaseService):
         for name in [x for x in methods if x.startswith("error_")]:
             method = getattr(self, name)
             code = int(name.split("_", 2)[1])
-            self.app.error_handler_spec[None][code] = method
+            self.app.register_error_handler(code, method)
             self.logger.debug("Adding handler '%s' for error code '%d'", name, code)
 
     def run(self):

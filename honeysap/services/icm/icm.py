@@ -37,7 +37,7 @@ class SAPICMService(BaseHTTPService):
                                                                  icm_release)
 
     def route_index(self):
-        pass
+        return render_template("404.html"), 404
     route_index.rule = "/"
 
     def error_400(self, code):
