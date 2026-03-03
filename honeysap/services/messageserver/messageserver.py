@@ -20,7 +20,8 @@ from socket import timeout
 from socketserver import ThreadingMixIn
 from http.server import HTTPServer, BaseHTTPRequestHandler
 # External imports
-from pysap.SAPMS import SAPMS
+from pysap.SAPMS import (SAPMS, ms_flag_values, ms_iflag_values,
+                         ms_opcode_values)
 from pysap.SAPNI import SAPNIServerThreaded, SAPNIServerHandler, SAPNIClient
 # Custom imports
 from honeysap.core.logger import Loggeable
@@ -64,12 +65,15 @@ class SAPMSServerHandler(Loggeable, SAPNIServerHandler):
             data = {
                 "client": str(self.client_address),
                 "flag": flag,
+                "flag_name": ms_flag_values.get(flag, "UNKNOWN"),
                 "iflag": iflag,
+                "iflag_name": ms_iflag_values.get(iflag, "UNKNOWN"),
                 "fromname": fromname,
                 "toname": toname,
             }
             if opcode is not None:
                 data["opcode"] = opcode
+                data["opcode_name"] = ms_opcode_values.get(opcode, "UNKNOWN")
 
             self.session.add_event("MS packet received",
                                    data=data,
@@ -80,7 +84,11 @@ class SAPMSServerHandler(Loggeable, SAPNIServerHandler):
 
 
 class SAPMSServerThreaded(SAPNIServerThreaded):
-    pass
+    def __init__(self, server_address, RequestHandlerClass,
+                 bind_and_activate=True, base_cls=SAPMS, **kwargs):
+        SAPNIServerThreaded.__init__(self, server_address, RequestHandlerClass,
+                                     bind_and_activate=bind_and_activate,
+                                     base_cls=base_cls, **kwargs)
 
 
 class SAPMSService(BaseTCPService):
