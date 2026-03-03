@@ -33,20 +33,20 @@ from honeysap.core.service import BaseTCPService
 from honeysap.services.gateway.rfcsi_data import get_ddif_body
 
 
-# CPIC field markers — the second 2 bytes of each cpic_padd value identify
-# the field.  We use the full 4-byte paddings where they reliably appear in
-# the wire format, and fall back to 2-byte start-markers otherwise.
+# Full 4-byte CPIC field paddings from pysap.  In the login handshake the
+# TLV sequence is fixed, so the full padd (prev_end + field_start) reliably
+# matches.  Using .find() on 4 bytes is faster than scanning for 2-byte
+# markers byte-by-byte.
 CPIC_RFC_F_PADD = cpic_padd["cpic_RFC_f_padd"].encode("latin-1")
 CPIC_PROGRAM_PADD = cpic_padd["cpic_program_padd"].encode("latin-1")
+CPIC_USERNAME_PADD = cpic_padd["cpic_username1_padd"].encode("latin-1")
+CPIC_CLI_NBR_PADD = cpic_padd["cpic_cli_nbr1_padd"].encode("latin-1")
+CPIC_IP_PADD = cpic_padd["cpic_ip_padd"].encode("latin-1")
+CPIC_HOSTNAME_PADD = cpic_padd["cpic_host_sid_inbr_padd"].encode("latin-1")
+CPIC_DEST_PADD = cpic_padd["cpic_dest_padd"].encode("latin-1")
 
-# 2-byte field start markers (second half of the 4-byte padding).
-# The first 2 bytes vary depending on the preceding field, so we match on
-# the start-marker that is always at offset +2 of the 4-byte delimiter.
-MARKER_USERNAME = b"\x01\x11"   # cpic_username1
-MARKER_CLI_NBR = b"\x01\x14"   # cpic_cli_nbr1
+# 2-byte start-marker for password — not in pysap's cpic_padd dict.
 MARKER_PASSWORD = b"\x01\x17"  # cpic_password (scrambled)
-MARKER_IP = b"\x00\x07"        # cpic_ip
-MARKER_HOSTNAME = b"\x00\x08"  # cpic_host_sid_inbr (follows IP)
 
 # 64-byte lookup table used by SAP's ab_scramble function (from NWRFC SDK).
 # The password field is: [4-byte LE seed][scrambled password bytes].
@@ -155,6 +155,16 @@ def _decode_rfc_string(raw):
         except (UnicodeDecodeError, ValueError):
             pass
     return raw.decode("ascii", errors="replace").strip("\x00 ")
+
+
+# Pre-compiled regex for fallback UTF-16LE function name extraction.
+_RE_UTF16LE_FUNCNAME = re.compile(rb"((?:[A-Z/][A-Z0-9_/]\x00){4,})")
+
+# Monitor commands (GW_SEND_CMD) that indicate hostile intent.
+_DANGEROUS_MONITOR_CMDS = frozenset({
+    "SUICIDE", "DELETE_CONN", "CANCEL_CONN",
+    "DISCONNECT", "DELETE_CLIENT", "DELETE_REMGW",
+})
 
 
 def _make_conversation_id():
@@ -324,6 +334,11 @@ class SAPGatewayServerHandler(Loggeable, SAPNIServerHandler):
         elif req_type == 0x09:  # GW_SEND_CMD
             self._handle_send_cmd(raw, req_name)
 
+        elif req_type == 0x05:  # STOP_GATEWAY
+            self.logger.warning("STOP_GATEWAY from %s", str(self.client_address))
+            self.session.add_event("Dangerous gateway command attempted",
+                                   data={"req_type": req_name})
+
         elif req_type == 0x0b:  # GW_REGISTER_TP
             self.logger.debug("GW_REGISTER_TP from %s", str(self.client_address))
             self.session.add_event("TP registration request",
@@ -400,7 +415,7 @@ class SAPGatewayServerHandler(Loggeable, SAPNIServerHandler):
                                      "cmd": cmd_name,
                                      "cmd_id": cmd})
 
-        if cmd_name in ("SUICIDE", "STOP"):
+        if cmd_name in _DANGEROUS_MONITOR_CMDS:
             self.logger.warning("Dangerous monitor command '%s' from %s",
                                 cmd_name, str(self.client_address))
             self.session.add_event("Dangerous monitor command attempted",
@@ -633,12 +648,13 @@ class SAPGatewayServerHandler(Loggeable, SAPNIServerHandler):
             if client:
                 client.login_done = True
 
-            self.logger.info("RFC login from %s: user=%s client=%s password=%s ip=%s",
+            self.logger.info("RFC login from %s: user=%s client=%s password=%s ip=%s dest=%s",
                              str(self.client_address),
                              data.get("username", "N/A"),
                              data.get("client_number", "N/A"),
                              data.get("password", "N/A"),
-                             data.get("client_ip", "N/A"))
+                             data.get("client_ip", "N/A"),
+                             data.get("destination", "N/A"))
             self.session.add_event("RFC login", data=data)
 
             # Respond with login success — full response with TLV body
@@ -693,8 +709,7 @@ class SAPGatewayServerHandler(Loggeable, SAPNIServerHandler):
 
         # Fallback: search for UTF-16LE uppercase function-name patterns
         # like R\x00F\x00C\x00_\x00 in the body
-        match = re.search(
-            rb"((?:[A-Z/][A-Z0-9_/]\x00){4,})",
+        match = _RE_UTF16LE_FUNCNAME.search(
             raw[48:] if len(raw) > 48 else raw,
         )
         if match:
@@ -710,15 +725,16 @@ class SAPGatewayServerHandler(Loggeable, SAPNIServerHandler):
         return None
 
     def _extract_login_fields(self, raw, data):
-        """Extract username, client number, IP, hostname from the first
-        F_SAP_SEND (identified by the presence of the EBCDIC 'RFC' header).
+        """Extract username, client number, IP, hostname, destination and
+        program from the first F_SAP_SEND (the login handshake).
 
-        These fields use a TLV format: [2-byte end-prev][2-byte start-marker]
-        [2-byte big-endian length][data].  The 2-byte start-markers are
-        consistent; the end-prev bytes vary depending on prior fields.
+        In the login handshake the TLV sequence is fixed, so we use full
+        4-byte cpic_padd entries from pysap for reliable field extraction.
+        The password field is not in pysap's cpic_padd dict, so we fall
+        back to the 2-byte marker scan for that one.
         """
-        # Username (start-marker \x01\x11)
-        val, _ = _extract_cpic_field_by_marker(raw, MARKER_USERNAME)
+        # Username (cpic_username1_padd)
+        val = _extract_cpic_field_by_padd(raw, CPIC_USERNAME_PADD)
         if val:
             username = val.decode("ascii", errors="replace").strip("\x00 ")
             if username:
@@ -726,8 +742,8 @@ class SAPGatewayServerHandler(Loggeable, SAPNIServerHandler):
                 if self.client_address in self.server.clients:
                     self.server.clients[self.client_address].username = username
 
-        # Client number (start-marker \x01\x14)
-        val, _ = _extract_cpic_field_by_marker(raw, MARKER_CLI_NBR)
+        # Client number (cpic_cli_nbr1_padd)
+        val = _extract_cpic_field_by_padd(raw, CPIC_CLI_NBR_PADD)
         if val:
             cli_nbr = val.decode("ascii", errors="replace").strip("\x00 ")
             if cli_nbr:
@@ -735,27 +751,35 @@ class SAPGatewayServerHandler(Loggeable, SAPNIServerHandler):
                 if self.client_address in self.server.clients:
                     self.server.clients[self.client_address].client_nbr = cli_nbr
 
-        # Password (start-marker \x01\x17) — SAP XOR-scrambled
-        val, end_off = _extract_cpic_field_by_marker(raw, MARKER_PASSWORD)
+        # Password (2-byte marker \x01\x17) — SAP XOR-scrambled
+        # Not in pysap's cpic_padd dict, so we use marker-based extraction.
+        val, _ = _extract_cpic_field_by_marker(raw, MARKER_PASSWORD)
         if val:
             data["password_hash"] = val.hex()
             data["password"] = _descramble_rfc_password(val)
 
-        # Client IP (start-marker \x00\x07)
-        val, _ = _extract_cpic_field_by_marker(raw, MARKER_IP)
+        # Client IP (cpic_ip_padd)
+        val = _extract_cpic_field_by_padd(raw, CPIC_IP_PADD)
         if val:
             ip = val.decode("ascii", errors="replace").strip("\x00 ")
             if ip:
                 data["client_ip"] = ip
 
-        # Client hostname (start-marker \x00\x08, follows IP)
-        val, _ = _extract_cpic_field_by_marker(raw, MARKER_HOSTNAME)
+        # Client hostname/SID/instance (cpic_host_sid_inbr_padd)
+        val = _extract_cpic_field_by_padd(raw, CPIC_HOSTNAME_PADD)
         if val:
             hostname = val.decode("ascii", errors="replace").strip("\x00 ")
             if hostname:
                 data["client_hostname"] = hostname
 
-        # Program / client library
+        # Destination (cpic_dest_padd)
+        val = _extract_cpic_field_by_padd(raw, CPIC_DEST_PADD)
+        if val:
+            dest = val.decode("ascii", errors="replace").strip("\x00 ")
+            if dest:
+                data["destination"] = dest
+
+        # Program / client library (cpic_program_padd)
         val = _extract_cpic_field_by_padd(raw, CPIC_PROGRAM_PADD)
         if val:
             program = val.decode("ascii", errors="replace").strip("\x00 ")
@@ -898,10 +922,13 @@ class SAPGatewayServerHandler(Loggeable, SAPNIServerHandler):
 
     # -- RFC_SYSTEM_INFO support -------------------------------------------
 
+    # Function names the honeypot can respond to with full metadata.
+    _KNOWN_TARGET_FUNCTIONS = ("RFC_SYSTEM_INFO", "DDIF_FIELDINFO_GET")
+
     def _extract_target_function(self, raw):
         """Extract the target function name from an RFC_GET_FUNCTION_INTERFACE
         request by searching for known function names in UTF-16LE."""
-        for name in ("RFC_SYSTEM_INFO",):
+        for name in self._KNOWN_TARGET_FUNCTIONS:
             if name.encode("utf-16-le") in raw:
                 return name
         return None
