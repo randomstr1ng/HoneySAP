@@ -44,16 +44,31 @@ def load_ddic_catalog(path):
                     continue
                 if tabname not in catalog:
                     catalog[tabname] = []
-                inttype = (row.get("INTTYPE") or "").strip()
-                leng    = _int(row.get("LENG"))
-                intlen  = _int(row.get("INTLEN"))
+                inttype  = (row.get("INTTYPE") or "").strip()
+                datatype = (row.get("DATATYPE") or "").strip()
+                leng     = _int(row.get("LENG"))
+                intlen   = _int(row.get("INTLEN"))
                 # Some SAP systems export NUC internal lengths (INTLEN = LENG)
                 # for text-like field types instead of UC lengths (INTLEN = LENG*2).
                 # Normalise to UC so gateway arithmetic is consistent everywhere.
                 if inttype in _UC_DOUBLE_INTYPES and leng > 0 and intlen == leng:
                     intlen = leng * 2
+                # TTYP (embedded internal table) components have INTLEN=0 in the
+                # ABAP dictionary but occupy an 8-byte reference pointer at runtime
+                # (64-bit kernel).  Normalise to runtime values so the DFIES row
+                # is valid:
+                #   intlen = 8  (64-bit handle pointer)
+                #   inttype = 'h'  (internal-table handle — the NWRFC SDK uses
+                #       this to recognise the field as RFCTYPE_ITAB and calls
+                #       DDIF_FIELDINFO_GET for the line type named in ROLLNAME)
+                rollname = (row.get("ROLLNAME") or "").strip()
+                dfies_tabname = tabname   # default: parent structure name
+                if datatype == "TTYP":
+                    if intlen == 0:
+                        intlen = 8
+                    inttype = "h"   # override: SDK requires 'h' for RFCTYPE_ITAB
                 catalog[tabname].append({
-                    "tabname":    tabname,
+                    "tabname":    dfies_tabname,
                     "fieldname":  (row.get("FIELDNAME")  or "").strip(),
                     "position":   _int(row.get("POSITION")),
                     "keyflag":    (row.get("KEYFLAG")    or "").strip(),

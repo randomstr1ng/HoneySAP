@@ -346,6 +346,12 @@ def _build_dfies_row(field):
     _wc("KEYFLAG",    field["keyflag"])
     _wc("ROLLNAME",   field["rollname"])
     _wc("REPTEXT",    field["reptext"])
+    # Optional extra fields for TTYP (embedded internal table) components.
+    # REFTABLE carries the line-type name; COMPTYPE='T' flags embedded tables.
+    # The NWRFC SDK may use these to resolve the nested table's row descriptor.
+    if field.get("datatype") == "TTYP":
+        _wc("REFTABLE", field.get("rollname", ""))
+        _wc("COMPTYPE", "T")
 
     return bytes(row)
 
@@ -639,6 +645,15 @@ _BUILTIN_DDIC = {
         _fld("RSAU_SEL_INTV", "DAT_TO",   2, "DATS", "D", 8, 16),
         _fld("RSAU_SEL_INTV", "TIM_FROM", 3, "TIMS", "T", 6, 12),
         _fld("RSAU_SEL_INTV", "TIM_TO",   4, "TIMS", "T", 6, 12),
+    ],
+    # Line type for the /SLOAE/T_CODE nested table (TTYP) inside
+    # /SLOAE/T_MODULE_GENERATE.  The table carries ABAP source code lines;
+    # each row is a single CHAR(255) value.  The NWRFC SDK calls
+    # DDIF_FIELDINFO_GET for this type when it resolves the TTYP component
+    # in the parent structure's DFIES.  Empty fieldname ("") is how ABAP
+    # exposes "table of scalar" line types to pyrfc ({'' : "code line"}).
+    "/SLOAE/T_CODE": [
+        _fld("/SLOAE/T_CODE", "", 1, "CHAR", "C", 255, 510),
     ],
 }
 
