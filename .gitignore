@@ -65,3 +65,6 @@ target/
 .settings
 .claude
 .DS_Store
+
+# Other files
+*.trc
