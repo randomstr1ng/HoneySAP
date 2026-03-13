@@ -64,6 +64,16 @@ services:
         sid: PRD
         instance_number: "00"
 
+        # Optional: path to a semicolon-delimited RFM catalog CSV (exported
+        # from SAP with columns FUNCNAME;REMOTE_CALL;UPDATE_TASK;...PARAMTEXT).
+        # When set, the gateway will serve RFC_GET_FUNCTION_INTERFACE responses
+        # for any function module present in the catalog.
+        rfm_catalog: data/honeysap_rfm.csv
+        # Optional: path to the DDIC structure field definitions CSV (exported
+        # from SAP alongside the RFM catalog).  Used for DDIF_FIELDINFO_GET
+        # type lookups.
+        ddic_catalog: data/honeysap_ddic.csv
+
     -
         # SAP ICM (HTTP) service
         # ----------------------
