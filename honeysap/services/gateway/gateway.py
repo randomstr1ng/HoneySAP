@@ -52,8 +52,9 @@ CPIC_DEST_PADD = cpic_padd["cpic_dest_padd"].encode("latin-1")
 # only match when the preceding field is exactly the one that was captured.
 # Field order varies across NWRFC SDK versions, so we use the last 2 bytes
 # (the actual field-start marker) with the flexible marker scanner instead.
-MARKER_PASSWORD = b"\x01\x17"  # cpic_password (scrambled)
-MARKER_USERNAME  = b"\x01\x11"  # cpic_username1
+MARKER_PASSWORD  = b"\x01\x17"  # cpic_password (scrambled)
+MARKER_USERNAME  = b"\x01\x11"  # cpic_username1 (SAP logon user)
+MARKER_OS_USER   = b"\x00\x09"  # cpic_username2 (OS/client-side user)
 MARKER_CLI_NBR   = b"\x01\x14"  # cpic_cli_nbr1
 MARKER_IP        = b"\x00\x07"  # cpic_ip
 MARKER_HOSTNAME  = b"\x00\x08"  # cpic_host_sid_inbr
@@ -213,6 +214,76 @@ def _extract_rfc_params(raw):
     return params
 
 
+def _extract_xml_data(raw):
+    """Extract XML-encoded parameters and table rows from an RFC call body.
+
+    The NWRFC SDK serialises table/structure parameters as ASCII XML fragments
+    embedded in the F_SAP_SEND body, e.g.:
+
+        <IT_MODULE><item><FIELD>value</FIELD></item></IT_MODULE>
+        <IV_GUID>base64==</IV_GUID>
+
+    Returns a dict mapping parameter name → value, where value is either a
+    plain string (scalar) or a list of dicts/strings (table rows).
+    """
+    import html as _html
+    result = {}
+    raw_bytes = bytes(raw)
+
+    # Find the first '<' to locate the XML region; everything before is binary.
+    xml_start = raw_bytes.find(b"<")
+    if xml_start == -1:
+        return result
+
+    # Decode the tail of the packet as ASCII (XML is always ASCII in NWRFC).
+    try:
+        xml_region = raw_bytes[xml_start:].decode("ascii", errors="replace")
+    except Exception:
+        return result
+
+    # Extract all top-level <TAG>...</TAG> blocks.
+    for m in re.finditer(r'<([A-Z_/][A-Z0-9_/]*)>(.*?)</\1>', xml_region, re.DOTALL):
+        tag, content = m.group(1), m.group(2)
+        # Skip tags that look like inner fields (contain '<' → already captured
+        # by a parent match) or are very short noise tags.
+        if len(tag) < 2:
+            continue
+        content = content.strip()
+
+        # Table parameter: contains <item> rows.
+        if "<item>" in content:
+            rows = []
+            for item_m in re.finditer(r'<item>(.*?)</item>', content, re.DOTALL):
+                item_body = item_m.group(1).strip()
+                # Structured row: contains named sub-fields.
+                if "<" in item_body:
+                    row = {}
+                    for fld in re.finditer(r'<([A-Z_/][A-Z0-9_/]*)>(.*?)</\1>',
+                                           item_body, re.DOTALL):
+                        fname, fval = fld.group(1), fld.group(2)
+                        if fname == "T_CODE":
+                            # Nested table of ABAP lines.
+                            row[fname] = [
+                                _html.unescape(li.group(1))
+                                for li in re.finditer(r'<item>(.*?)</item>',
+                                                      fval, re.DOTALL)
+                            ]
+                        else:
+                            row[fname] = _html.unescape(fval.strip())
+                    if row:
+                        rows.append(row)
+                else:
+                    # Scalar row (table of a single unnamed field).
+                    rows.append(_html.unescape(item_body))
+            if rows:
+                result[tag] = rows
+        else:
+            # Scalar parameter.
+            result[tag] = _html.unescape(content)
+
+    return result
+
+
 def _make_conversation_id():
     """Generate an 8-digit numeric conversation ID like a real SAP gateway."""
     return "".join([str(SystemRandom().randint(0, 9)) for _ in range(8)])
@@ -346,12 +417,14 @@ def _build_dfies_row(field):
     _wc("KEYFLAG",    field["keyflag"])
     _wc("ROLLNAME",   field["rollname"])
     _wc("REPTEXT",    field["reptext"])
-    # Optional extra fields for TTYP (embedded internal table) components.
-    # REFTABLE carries the line-type name; COMPTYPE='T' flags embedded tables.
-    # The NWRFC SDK may use these to resolve the nested table's row descriptor.
+    # TTYP (embedded internal table) fields in a structure:
+    # COMPTYPE='L' = embedded internal table handle (not 'T' which means a
+    # table TYPE's line field).  REFTABLE is for FK references, not line types;
+    # the line type name is already in ROLLNAME.  Using 'T' or setting REFTABLE
+    # causes the SDK to inline the table's line fields into the parent structure
+    # layout → rc=20 overlap.  Confirmed from real SAP pcap analysis.
     if field.get("datatype") == "TTYP":
-        _wc("REFTABLE", field.get("rollname", ""))
-        _wc("COMPTYPE", "T")
+        _wc("COMPTYPE", "L")
 
     return bytes(row)
 
@@ -456,16 +529,216 @@ def _build_x030l_wa_row(tabname, nuc_len):
 # Captured verbatim from SAP NW 7.52; markers 0x3c02/0x3c05 are used for
 # the <LINES_DESCR></LINES_DESCR> XML-style metadata tags (ASCII content).
 # After the block, the current marker is 0x3c02 — use that as prev for X030L_WA.
-_LINES_DESCR_BLOCK = bytes.fromhex(
-    "02033c020000"                          # prev=0x0203 → 0x3c02, empty
-    "3c023c05000d"
-    "3c4c494e45535f44455343523e"            # <LINES_DESCR>  (13 bytes ASCII)
-    "3c053c05000e"
-    "3c2f4c494e45535f44455343523e"          # </LINES_DESCR> (14 bytes ASCII)
-    "3c053c020000"                          # prev=0x3c05 → 0x3c02, empty
-)
-# After _LINES_DESCR_BLOCK the active marker is 0x3c02.
+_LINES_DESCR_CHUNK_SIZE = 1024   # bytes per inner TLV chunk (from pcap)
+# After a LINES_DESCR block the active marker is 0x3c02.
 _LINES_DESCR_TRAIL_MARKER = 0x3c02
+
+
+def _build_lines_descr_block(xml_content=None):
+    """Build the LINES_DESCR TLV block that precedes X030L_WA.
+
+    When *xml_content* is None or empty the block contains only the bare
+    ``<LINES_DESCR></LINES_DESCR>`` tags (empty, same as the original
+    constant).  When *xml_content* is a non-empty ``bytes`` object it is
+    split into 1024-byte inner TLVs (observed chunk size from real SAP).
+
+    Block layout (all big-endian 2-byte ints):
+        [0x0203][0x3c02][0x0000]              – empty 0x3c02 slot
+        [0x3c02][0x3c05][0x000d]<LINES_DESCR>
+        ([0x3c05][0x3c05][len]<chunk>)*       – content chunks, if any
+        [0x3c05][0x3c05][0x000e]</LINES_DESCR>
+        [0x3c05][0x3c02][0x0000]              – return to 0x3c02 zone
+    """
+    block  = struct.pack("!HHH", 0x0203, 0x3c02, 0)
+    block += struct.pack("!HHH", 0x3c02, 0x3c05, 13) + b"<LINES_DESCR>"
+    if xml_content:
+        for i in range(0, len(xml_content), _LINES_DESCR_CHUNK_SIZE):
+            chunk = xml_content[i:i + _LINES_DESCR_CHUNK_SIZE]
+            block += struct.pack("!HHH", 0x3c05, 0x3c05, len(chunk)) + chunk
+    block += struct.pack("!HHH", 0x3c05, 0x3c05, 14) + b"</LINES_DESCR>"
+    block += struct.pack("!HHH", 0x3c05, 0x3c02, 0)
+    return block
+
+
+def _xml_field_item(tabname, fieldname, position, offset, leng, intlen, outputlen,
+                    datatype, inttype, rollname="", comptype="E"):
+    """Build one ``<item>…</item>`` XML block for LINES_DESCR field metadata.
+
+    The tag list and format are derived from real SAP NW DDIF responses
+    (pcap analysis).  Tags not relevant for SDK type-registration are left
+    empty; they are still required because the SDK expects the full tag set.
+    """
+    def t(name, val=""):
+        return f"<{name}>{val}</{name}>"
+
+    return (
+        "<item>"
+        + t("TABNAME", tabname)
+        + t("FIELDNAME", fieldname)
+        + t("LANGU")
+        + t("POSITION", f"{position:04d}")
+        + t("OFFSET", f"{offset:06d}")
+        + t("DOMNAME")
+        + t("ROLLNAME", rollname)
+        + t("CHECKTABLE")
+        + t("LENG", f"{leng:06d}")
+        + t("INTLEN", f"{intlen:06d}")
+        + t("OUTPUTLEN", f"{outputlen:06d}")
+        + t("DECIMALS", "000000")
+        + t("DATATYPE", datatype)
+        + t("INTTYPE", inttype)
+        + t("REFTABLE")
+        + t("REFFIELD")
+        + t("PRECFIELD")
+        + t("AUTHORID")
+        + t("MEMORYID")
+        + t("LOGFLAG")
+        + t("MASK")
+        + t("MASKLEN", "0000")
+        + t("CONVEXIT")
+        + t("HEADLEN", "00")
+        + t("SCRLEN1", "00")
+        + t("SCRLEN2", "00")
+        + t("SCRLEN3", "00")
+        + t("FIELDTEXT")
+        + t("REPTEXT")
+        + t("SCRTEXT_S")
+        + t("SCRTEXT_M")
+        + t("SCRTEXT_L")
+        + t("KEYFLAG")
+        + t("LOWERCASE")
+        + t("MAC")
+        + t("GENKEY")
+        + t("NOFORKEY")
+        + t("VALEXI")
+        + t("NOAUTHCH")
+        + t("SIGN")
+        + t("DYNPFLD")
+        + t("F4AVAILABL")
+        + t("COMPTYPE", comptype)
+        + t("LFIELDNAME", fieldname)
+        + t("LTRFLDDIS")
+        + t("BIDICTRLC")
+        + t("OUTPUTSTYLE", "00")
+        + t("NOHISTORY")
+        + t("AMPMFORMAT")
+        + "</item>"
+    ).encode("ascii")
+
+
+def _build_lines_descr_xml(tabname, fields, nuc_mode, catalog_fn=None):
+    """Build the XML content for LINES_DESCR for *tabname*.
+
+    Returns a ``bytes`` object with the XML, or ``None`` if the structure
+    has no TTYP (nested internal-table) fields and therefore needs no
+    LINES_DESCR content (the SDK is happy with an empty block in that case).
+
+    *fields* — list of field dicts (same format as DFIES rows), sorted by
+    position.  Must include TTYP fields (inttype='h').
+
+    *nuc_mode* — True when the partner uses Communication Codepage 1100
+    (NUC); INTLEN values in the XML are halved for CHAR-like types.
+
+    *catalog_fn* — callable that takes a type name and returns its field
+    list (used to look up line types for TTYP fields).
+    """
+    ttyp_fields = [f for f in fields if f.get("inttype") == "h"]
+    if not ttyp_fields:
+        # No nested TTYP fields — empty LINES_DESCR is sufficient.
+        # The SDK either already knows this type (from a parent's LINES_DESCR)
+        # or reads its field info from DFIES rows.
+        return None
+
+    # STRU: fields with named columns containing at least one TTYP handle.
+    typekind = "STRU"
+
+    # For table types the LINES_DESCR item 1 TYPENAME must be the line
+    # structure (not the table type itself).  Real SAP sends TYPENAME=
+    # <line_struct> so the SDK associates the table type with its row structure
+    # and subsequently calls DDIF for the line structure by name.
+    item1_typename = _TABLE_TYPE_LINETYPE.get(tabname, tabname)
+
+    # Build field items for the structure itself.
+    field_items = b""
+    offset = 0
+    for f in sorted(fields, key=lambda x: int(x.get("position") or 0)):
+        inttype = f.get("inttype", "")
+        intlen  = int(f.get("intlen") or 0)
+        leng    = int(f.get("leng") or 0)
+        if nuc_mode and inttype in _UC2_INTTYPES:
+            xml_intlen = intlen // 2
+        else:
+            xml_intlen = intlen
+        comptype = "L" if inttype == "h" else "E"
+        field_items += _xml_field_item(
+            tabname=item1_typename,
+            fieldname=f.get("fieldname", ""),
+            position=int(f.get("position") or 0),
+            offset=offset,
+            leng=leng,
+            intlen=xml_intlen,
+            outputlen=int(f.get("outputlen") or leng),
+            datatype=f.get("datatype", ""),
+            inttype=inttype,
+            rollname=f.get("rollname", ""),
+            comptype=comptype,
+        )
+        offset += xml_intlen
+
+    # Only include the STRU item 1 when it names a DIFFERENT type (the line
+    # structure of a table type, e.g. T_MODULE_GENERATE → S_MODULE_GENERATE).
+    # When item1_typename == tabname the DFIES rows already describe the
+    # structure; a redundant item 1 causes the SDK to see conflicting field
+    # data and merge the nested TTYP line fields into the flat layout (→ rc=20).
+    # Real SAP sends item 1 only for table types; structures get ONLY item 2+.
+    if item1_typename != tabname:
+        xml = (
+            f"<item><TYPENAME>{item1_typename}</TYPENAME>"
+            f"<TYPEKIND>{typekind}</TYPEKIND>"
+            f"<FIELDS>{field_items.decode('ascii')}</FIELDS></item>"
+        ).encode("ascii")
+    else:
+        xml = b""
+
+    # Append nested-type items for each TTYP field.
+    for tf in ttyp_fields:
+        rollname = tf.get("rollname", "")
+        if not rollname or catalog_fn is None:
+            continue
+        nested = catalog_fn(rollname)
+        if not nested:
+            continue
+        nested_items = b""
+        nested_offset = 0
+        for nf in sorted(nested, key=lambda x: int(x.get("position") or 0)):
+            n_inttype = nf.get("inttype", "")
+            n_intlen  = int(nf.get("intlen") or 0)
+            n_leng    = int(nf.get("leng") or 0)
+            if nuc_mode and n_inttype in _UC2_INTTYPES:
+                n_xml_intlen = n_intlen // 2
+            else:
+                n_xml_intlen = n_intlen
+            nested_items += _xml_field_item(
+                tabname=rollname,
+                fieldname=nf.get("fieldname", ""),
+                position=int(nf.get("position") or 0),
+                offset=nested_offset,
+                leng=n_leng,
+                intlen=n_xml_intlen,
+                outputlen=int(nf.get("outputlen") or n_leng),
+                datatype=nf.get("datatype", ""),
+                inttype=n_inttype,
+                rollname=nf.get("rollname", ""),
+                comptype="T",  # TTYP line field
+            )
+            nested_offset += n_xml_intlen
+        xml += (
+            f"<item><TYPENAME>{rollname}</TYPENAME>"
+            f"<TYPEKIND>TTYP</TYPEKIND>"
+            f"<FIELDS>{nested_items.decode('ascii')}</FIELDS></item>"
+        ).encode("ascii")
+
+    return xml or None
 
 
 # ---------------------------------------------------------------------------
@@ -648,14 +921,50 @@ _BUILTIN_DDIC = {
     ],
     # Line type for the /SLOAE/T_CODE nested table (TTYP) inside
     # /SLOAE/T_MODULE_GENERATE.  The table carries ABAP source code lines;
-    # each row is a single CHAR(255) value.  The NWRFC SDK calls
-    # DDIF_FIELDINFO_GET for this type when it resolves the TTYP component
-    # in the parent structure's DFIES.  Empty fieldname ("") is how ABAP
-    # exposes "table of scalar" line types to pyrfc ({'' : "code line"}).
+    # each row is a single CHAR(72) value (confirmed from working exploit
+    # pcap: LENG=000072, INTLEN=000144 in UC DDIF call).  Empty fieldname
+    # ("") is how ABAP exposes "table of scalar" line types to pyrfc.
     "/SLOAE/T_CODE": [
-        _fld("/SLOAE/T_CODE", "", 1, "CHAR", "C", 255, 510),
+        _fld("/SLOAE/T_CODE", "", 1, "CHAR", "C", 72, 144),
+    ],
+    # Line structure for the /SLOAE/T_MODULE_GENERATE table type.
+    # The ABAP DDIC exports T_MODULE_GENERATE's fields under its own TABNAME,
+    # but the SDK also calls DDIF for S_MODULE_GENERATE (the actual row
+    # structure) after learning its name from the LINES_DESCR XML in the
+    # T_MODULE_GENERATE DDIF response.  We answer that call with the same 3
+    # fields.  T_CODE is a TTYP handle (inttype='h', intlen=8 runtime pointer)
+    # whose ROLLNAME tells the SDK to call DDIF for /SLOAE/T_CODE next.
+    "/SLOAE/S_MODULE_GENERATE": [
+        _fld("/SLOAE/S_MODULE_GENERATE", "MODULE_GUID", 1, "RAW",  "X", 16, 16),
+        _fld("/SLOAE/S_MODULE_GENERATE", "REPORT_NAME", 2, "CHAR", "C", 40, 80,
+             rollname="PROGNAME"),
+        _fld("/SLOAE/S_MODULE_GENERATE", "T_CODE",      3, "TTYP", "h",  0,  8,
+             rollname="/SLOAE/T_CODE"),
     ],
 }
+
+
+# Maps table-type TABNAME → line-structure TABNAME for types where the
+# ABAP DDIC catalog exports the table type's fields under the table type's
+# own name but the SDK expects the line structure name in LINES_DESCR item 1.
+# Real SAP sends TYPENAME=<line_struct> (not the table type) in LINES_DESCR
+# item 1 so the SDK correctly associates the table type with its row struct.
+_TABLE_TYPE_LINETYPE = {
+    "/SLOAE/T_MODULE_GENERATE": "/SLOAE/S_MODULE_GENERATE",
+}
+
+# TABNAMEs for which the DDIF response must contain 0 DFIES rows even though
+# _BUILTIN_DDIC / ddic_catalog has field definitions for them.
+#
+# These are "table of scalar" line types whose field layout is already
+# described in the parent structure's LINES_DESCR item 2.  If we return DFIES
+# rows for these types the SDK re-registers them as STRU (overriding the TTYP
+# registration from the parent's LINES_DESCR) and then tries to inline their
+# fields into the parent structure → rc=20 offset overlap.
+# Real SAP returns 0 DFIES rows + empty LINES_DESCR for these types.
+_SUPPRESS_DFIES_TABNAMES = frozenset({
+    "/SLOAE/T_CODE",
+})
 
 
 def _build_params_row(paramclass, parameter, tabname, fieldname, exid,
@@ -1092,9 +1401,19 @@ class SAPGatewayServerHandler(Loggeable, SAPNIServerHandler):
                     if val:
                         data[field] = val
 
+                # The NWRFC SDK null-terminates the 12-byte 'user' field with
+                # strlcpy semantics: for a 12-char OS username the null
+                # overwrites the last character, so only 11 chars are
+                # transmitted.  Flag this so log consumers know the value may
+                # be one char short (use the SAP logon username from
+                # F_SAP_SEND as the authoritative identity instead).
+                user_val = data.get("user", "")
+                if len(user_val) == 11:
+                    data["os_user_truncated"] = True
+
                 # Track user on connection
-                if data.get("user") and self.client_address in self.server.clients:
-                    self.server.clients[self.client_address].username = data["user"]
+                if user_val and self.client_address in self.server.clients:
+                    self.server.clients[self.client_address].username = user_val
 
             sap_ext = getattr(rfc, "sap_ext_header", None)
             if sap_ext and isinstance(sap_ext, SAPRFCEXTEND):
@@ -1105,9 +1424,12 @@ class SAPGatewayServerHandler(Loggeable, SAPNIServerHandler):
         except Exception as e:
             self.logger.debug("Error parsing F_INITIALIZE_CONVERSATION: %s", e)
 
+        user_display = data.get("user", "N/A")
+        if data.get("os_user_truncated"):
+            user_display += "? (truncated)"
         self.logger.info("RFC connection from %s: user=%s dest=%s lu=%s",
                          str(self.client_address),
-                         data.get("user", "N/A"),
+                         user_display,
                          data.get("short_dest_name", "N/A"),
                          data.get("long_lu", "N/A"))
         self.session.add_event("APPC init conversation", data=data)
@@ -1214,13 +1536,16 @@ class SAPGatewayServerHandler(Loggeable, SAPNIServerHandler):
             if client:
                 client.login_done = True
 
-            self.logger.info("RFC login from %s: user=%s client=%s password=%s ip=%s dest=%s",
-                             str(self.client_address),
-                             data.get("username", "N/A"),
-                             data.get("client_number", "N/A"),
-                             data.get("password", "N/A"),
-                             data.get("client_ip", "N/A"),
-                             data.get("destination", "N/A"))
+            self.logger.info(
+                "RFC login from %s: user=%s os_user=%s client=%s password=%s ip=%s dest=%s",
+                str(self.client_address),
+                data.get("username", "N/A"),
+                data.get("os_username", "N/A"),
+                data.get("client_number", "N/A"),
+                data.get("password", "N/A"),
+                data.get("client_ip", "N/A"),
+                data.get("destination", "N/A"),
+            )
             self.session.add_event("RFC login", data=data)
 
             # Respond with login success — full response with TLV body
@@ -1250,6 +1575,30 @@ class SAPGatewayServerHandler(Loggeable, SAPNIServerHandler):
                     str(self.client_address),
                     ("  [" + param_str + "]") if param_str else "",
                 )
+                # Log XML-encoded extended data (tables and structures).
+                xml_data = _extract_xml_data(raw)
+                if xml_data:
+                    data["xml_data"] = xml_data
+                    for tag, val in xml_data.items():
+                        if isinstance(val, list):
+                            self.logger.warning("    %s: (%d row(s))", tag, len(val))
+                            for i, row in enumerate(val, 1):
+                                if isinstance(row, dict):
+                                    for fname, fval in row.items():
+                                        if isinstance(fval, list):
+                                            self.logger.warning(
+                                                "      [%d] %s: (%d line(s))",
+                                                i, fname, len(fval))
+                                            for j, line in enumerate(fval, 1):
+                                                self.logger.warning(
+                                                    "        [%3d] %s", j, line)
+                                        else:
+                                            self.logger.warning(
+                                                "      [%d] %s: %s", i, fname, fval)
+                                else:
+                                    self.logger.warning("      [%d] %s", i, row)
+                        else:
+                            self.logger.warning("    %s: %s", tag, val)
             else:
                 self.logger.info("RFC call from %s: %s (user=%s, client=%s)",
                                  str(self.client_address), func_display,
@@ -1267,10 +1616,80 @@ class SAPGatewayServerHandler(Loggeable, SAPNIServerHandler):
                     self._send_sysinfo_response(raw)
                 elif func_module == "DDIF_FIELDINFO_GET":
                     self._send_ddif_response(raw)
+                elif func_module == "/SLOAE/DEPLOY":
+                    self._log_sloae_deploy(raw, data)
+                    self._send_rfc_response(raw)
                 else:
                     self._send_rfc_response(raw)
             except error:
                 pass
+
+    def _log_sloae_deploy(self, raw, data):
+        """Extract and log the ABAP payload from a /SLOAE/DEPLOY call.
+
+        The NWRFC SDK serialises the IT_MODULE table as an ASCII XML fragment
+        embedded in the F_SAP_SEND body:
+
+            <IT_MODULE><item>
+              <MODULE_GUID>base64==</MODULE_GUID>
+              <REPORT_NAME>LSRFCU07</REPORT_NAME>
+              <T_CODE><item>ABAP line</item>...</T_CODE>
+            </item></IT_MODULE>
+
+        Each <T_CODE><item> holds one ABAP source line.  HTML entities
+        (&#38; &#62; etc.) are present in the raw XML; html.unescape() decodes
+        them so the logged code matches what SAP would compile.
+        """
+        import html as _html
+        payload_info = {}
+
+        raw_bytes = bytes(raw)
+        # Locate the IT_MODULE XML block (always ASCII in NWRFC wire format).
+        m = re.search(rb'<IT_MODULE>(.*?)</IT_MODULE>', raw_bytes, re.DOTALL)
+        if not m:
+            return
+        xml_block = m.group(1).decode("ascii", errors="replace")
+
+        # REPORT_NAME — target ABAP program being overwritten.
+        rn = re.search(r'<REPORT_NAME>(.*?)</REPORT_NAME>', xml_block)
+        if rn:
+            payload_info["report_name"] = rn.group(1).strip()
+
+        # MODULE_GUID — base64-encoded 16-byte RAW field.
+        mg = re.search(r'<MODULE_GUID>(.*?)</MODULE_GUID>', xml_block)
+        if mg:
+            payload_info["module_guid"] = mg.group(1).strip()
+
+        # T_CODE lines — each <item> is one ABAP source line.
+        t_code_m = re.search(r'<T_CODE>(.*?)</T_CODE>', xml_block, re.DOTALL)
+        if t_code_m:
+            lines = re.findall(r'<item>(.*?)</item>', t_code_m.group(1), re.DOTALL)
+            payload_info["abap_lines"] = [_html.unescape(l) for l in lines]
+
+        if not payload_info:
+            return
+
+        report = payload_info.get("report_name", "?")
+        guid   = payload_info.get("module_guid", "?")
+        lines  = payload_info.get("abap_lines", [])
+
+        self.logger.warning(
+            "!!! CVE-2025-42957 /SLOAE/DEPLOY: target_program=%s  guid=%s  "
+            "abap_lines=%d",
+            report, guid, len(lines),
+        )
+        for i, line in enumerate(lines, 1):
+            self.logger.warning("    [%3d] %s", i, line)
+
+        data["sloae_deploy"] = payload_info
+        self.session.add_event(
+            "SLOAE deploy payload",
+            data={
+                "report_name": report,
+                "module_guid": guid,
+                "abap_code": "\n".join(lines),
+            },
+        )
 
     def _extract_function_module(self, raw):
         """Extract the RFC function module name from raw packet bytes.
@@ -1307,14 +1726,25 @@ class SAPGatewayServerHandler(Loggeable, SAPNIServerHandler):
         All fields use the 2-byte marker scanner so that extraction is
         independent of field order, which varies across NWRFC SDK versions.
         """
-        # Username
+        # SAP logon username (cpic_username1, marker 0x0111)
         val, _ = _extract_cpic_field_by_marker(raw, MARKER_USERNAME)
         if val:
+            self.logger.debug("login username1 raw (%d bytes): %s", len(val), val.hex())
             username = val.decode("ascii", errors="replace").strip("\x00 ")
             if username:
                 data["username"] = username
                 if self.client_address in self.server.clients:
                     self.server.clients[self.client_address].username = username
+
+        # OS / client-side username (cpic_username2, marker 0x0009).
+        # NWRFC SDK sends the local OS user here; it is absent in some
+        # older SAP GUI / non-NWRFC clients.
+        val, _ = _extract_cpic_field_by_marker(raw, MARKER_OS_USER)
+        if val:
+            self.logger.debug("login username2 raw (%d bytes): %s", len(val), val.hex())
+            os_user = val.decode("ascii", errors="replace").strip("\x00 ")
+            if os_user:
+                data["os_username"] = os_user
 
         # Client number
         val, _ = _extract_cpic_field_by_marker(raw, MARKER_CLI_NBR)
@@ -1677,6 +2107,12 @@ class SAPGatewayServerHandler(Loggeable, SAPNIServerHandler):
                     # Single CHAR-based field → treat as scalar CHAR
                     exid = "C"
                     tabname = resolved_tabname
+            # For table types (EXID='h') that have a known line structure,
+            # substitute the line structure name as TABNAME.  The SDK then
+            # calls DDIF for the line structure directly (which has the actual
+            # field definitions) rather than for the table type wrapper.
+            if exid == "h" and tabname in _TABLE_TYPE_LINETYPE:
+                tabname = _TABLE_TYPE_LINETYPE[tabname]
             nuc_il = _nuc_intlength(exid, p["intlength"],
                                     tabname, self.ddic_catalog)
             self.logger.debug(
@@ -1831,7 +2267,7 @@ class SAPGatewayServerHandler(Loggeable, SAPNIServerHandler):
         return first_nonempty
 
     def _build_ddif_body(self, session_id, dfies_rows=None,
-                         dfies_wa=None, x030l_wa=None):
+                         dfies_wa=None, x030l_wa=None, lines_descr_xml=None):
         """Build a DDIF_FIELDINFO_GET response.
 
         When *dfies_rows* is a list of 1350-byte DFIES row blobs (produced by
@@ -1845,6 +2281,12 @@ class SAPGatewayServerHandler(Loggeable, SAPNIServerHandler):
         export (also present on call #2+ from real SAP servers).  Contains
         the authoritative NUC record length (TABLEN) that the NWRFC SDK
         validates against PARAMS.INTLENGTH.
+
+        *lines_descr_xml* — optional ``bytes`` XML content to embed inside
+        the LINES_DESCR block.  Required for structures that contain TTYP
+        (nested internal-table) fields; the SDK uses the XML to discover and
+        register those nested types.  When None the block is empty (fine for
+        flat structures).
 
         TLV structure reverse-engineered from captured RFCSI DDIF blobs.
         """
@@ -1886,7 +2328,9 @@ class SAPGatewayServerHandler(Loggeable, SAPNIServerHandler):
         if x030l_wa is not None:
             # LINES_DESCR block: transitions from 0x0203 → 0x3c02 marker zone.
             # Without this block the SDK cannot parse X030L_WA (TABLEN reads 0).
-            body += _LINES_DESCR_BLOCK
+            # When lines_descr_xml is set, the block carries XML type metadata
+            # for nested TTYP fields so the SDK can discover those types.
+            body += _build_lines_descr_block(lines_descr_xml)
             prev_tab = _LINES_DESCR_TRAIL_MARKER   # 0x3c02
             body += _tlv(prev_tab, 0x0201, utf16("X030L_WA"))
             body += _tlv(0x0201, 0x0203, x030l_wa)
@@ -2066,9 +2510,39 @@ class SAPGatewayServerHandler(Loggeable, SAPNIServerHandler):
                 else:
                     dfies_wa = _build_dfies_wa_row()
                     x030l_wa = _build_x030l_wa_row(tabname, uc_total)
-                body = self._build_ddif_body(session_id, dfies_rows,
+                # LINES_DESCR: build XML for structures with TTYP fields so
+                # the NWRFC SDK can discover and register nested types.
+                # The *full* field list (including TTYP/inttype='h' fields
+                # filtered out of flat_fields) must be used here.
+                # NUC/UC INTLEN values in the XML match the DFIES wire mode.
+                lines_descr_xml = _build_lines_descr_xml(
+                    tabname, fields, nuc_mode,
+                    catalog_fn=self._get_ddic_fields,
+                )
+                # Table types (e.g. T_MODULE_GENERATE) must send 0 DFIES rows
+                # because their LINES_DESCR item 1 names the LINE STRUCTURE
+                # (S_MODULE_GENERATE), not the table type itself.  The SDK
+                # reads the row structure from LINES_DESCR; sending DFIES rows
+                # alongside LINES_DESCR causes the SDK to merge the nested
+                # type's fields into the table type's flat layout → overlap.
+                # Structures with TTYP fields (e.g. S_MODULE_GENERATE) still
+                # send their own DFIES rows; only the nested TTYP entries
+                # are described via LINES_DESCR item 2+.
+                is_table_type = tabname in _TABLE_TYPE_LINETYPE
+                suppress_dfies = is_table_type or (tabname in _SUPPRESS_DFIES_TABNAMES)
+                dfies_for_body = [] if suppress_dfies else dfies_rows
+                # _SUPPRESS_DFIES_TABNAMES types (e.g. /SLOAE/T_CODE) must
+                # send 0 DFIES rows so the SDK does not re-register them as
+                # a flat STRU (overriding the TTYP registration from the
+                # parent's LINES_DESCR).  X030L_WA and DFIES_WA are still
+                # required: real SAP sends X030L_WA(TABLEN=72 NUC / 144 UC)
+                # for T_CODE so lock() has a non-zero nucSize to validate
+                # against.  LINES_DESCR is already None for these types since
+                # they have no TTYP sub-fields.
+                body = self._build_ddif_body(session_id, dfies_for_body,
                                              dfies_wa=dfies_wa,
-                                             x030l_wa=x030l_wa)
+                                             x030l_wa=x030l_wa,
+                                             lines_descr_xml=lines_descr_xml)
                 source = (
                     "catalog" if tabname in self.ddic_catalog
                     else "builtins" if tabname in _BUILTIN_DDIC
@@ -2080,6 +2554,8 @@ class SAPGatewayServerHandler(Loggeable, SAPNIServerHandler):
                 if x030l_wa is not None:
                     tablen = nuc_total if tabname_call_num == 1 else uc_total
                     extras += " [+X030L_WA tablen=%d]" % tablen
+                if lines_descr_xml:
+                    extras += " [+LINES_DESCR %dB]" % len(lines_descr_xml)
                 skipped = len(fields) - len(flat_fields)
                 self.logger.info(
                     "DDIF '%s' (call #%d): %d field(s) from %s%s, "
