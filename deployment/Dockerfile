@@ -1,8 +1,8 @@
-# HoneySAP Dockerfile for running HoneySAP
+# HoneySAP Dockerfile
 
 FROM ubuntu:22.04
 
-MAINTAINER martin.gallo@gmail.com
+LABEL maintainer="martin.gallo@gmail.com"
 
 # Install system packages
 RUN apt-get update && apt-get install -y \
@@ -17,16 +17,24 @@ RUN apt-get update && apt-get install -y \
 COPY . /opt/honeysap
 WORKDIR /opt/honeysap
 
-# Install prebuilt pysap (not yet published on PyPI)
-COPY pysap/dist/pysap-0.1.20.dev0.tar.gz /tmp/pysap.tar.gz
-RUN python3 -m pip install /tmp/pysap.tar.gz && \
-    rm -f /tmp/pysap.tar.gz
+# Install pysap: use a local wheel/tarball if one was bundled with the
+# source tree (offline / air-gapped builds), otherwise pull from GitHub.
+RUN if find pysap/dist -name "pysap-*.tar.gz" 2>/dev/null | grep -q .; then \
+        python3 -m pip install "$(find pysap/dist -name 'pysap-*.tar.gz' | sort | tail -1)"; \
+    else \
+        python3 -m pip install "git+https://github.com/OWASP/pysap.git"; \
+    fi
 
 # Install HoneySAP
-RUN cd /opt/honeysap && \
-    python3 -m pip install . && \
+RUN python3 -m pip install . && \
     rm -rf /tmp/* /var/tmp/*
 
-EXPOSE 3299 8001
+# SAP Router     : 3299
+# SAP Dispatcher : 3200
+# SAP Gateway    : 3300
+# SAP ICM (HTTP) : 8000
+# SAP Msg Server : 3600
+# SAP MS (HTTP)  : 8100
+EXPOSE 3299 3200 3300 8000 3600 8100
 
-CMD ["/usr/local/bin/honeysap", "--config-file", "honeysap.yml"]
+CMD ["/usr/local/bin/honeysap", "--config-file", "profiles/internal.yml"]
