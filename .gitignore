@@ -63,3 +63,8 @@ target/
 .project
 .pydevproject
 .settings
+.claude
+.DS_Store
+
+# Other files
+*.trc
