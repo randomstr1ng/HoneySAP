@@ -96,7 +96,7 @@ class SAPMSService(BaseTCPService):
     server_cls = SAPMSServerThreaded
     handler_cls = SAPMSServerHandler
 
-    default_port = 3300
+    default_port = 3600
 
 
 class SAPMSHTTPServerHandler(Loggeable, BaseHTTPRequestHandler):
