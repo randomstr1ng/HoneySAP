@@ -100,6 +100,7 @@ def _descramble_rfc_password(raw_field):
         sval = ((seed * i * i) - i) & 0xFFFFFFFF
         data[i] ^= _AB_SCRAMBLE_TABLE[tidx] ^ (sval & 0xFF)
 
+    # Try ASCII (direct-RFC / NUC mode)
     plain = bytes(data).rstrip(b"\x00")
     try:
         text = plain.decode("ascii")
@@ -107,6 +108,17 @@ def _descramble_rfc_password(raw_field):
             return text
     except (UnicodeDecodeError, ValueError):
         pass
+
+    # Try UTF-16LE (GW / Unicode mode): the scrambler operates on raw bytes
+    # so the descrambled output is still UTF-16LE (one null high-byte per ASCII char).
+    try:
+        if len(data) % 2 == 0:
+            text = bytes(data).decode("utf-16-le").rstrip("\x00")
+            if text and text.isprintable():
+                return text
+    except (UnicodeDecodeError, ValueError):
+        pass
+
     return raw_field.hex()
 
 
@@ -300,6 +312,42 @@ _CPIC_HEADER = bytes.fromhex(
     "01010008010101050401000301010103"
     "000400000e0b01030106000b04010003"
     "00030200000023"
+)
+
+# Gateway-to-gateway variant: byte[4]=0x05, byte[32]=0x01 (from A4H pcap).
+_CPIC_HEADER_GW = (lambda h: bytes([h[i] if i not in (4, 32) else
+                                    (0x05 if i == 4 else 0x01)
+                                    for i in range(len(h))])
+                   )(_CPIC_HEADER)
+
+# GW function-response constants derived from A4H-A4H SM59 pcap capture.
+# 0x5001 TLV payload (15 bytes): CPIC session-state block.
+_GW_5001_DATA = bytes.fromhex("244803030041030023004020000045")
+# 8-byte IEEE-754 double sent in _tlv(0x0130, 0x0667, ...) for GW responses.
+_GW_0667_FLOAT = bytes.fromhex("0000000000804740")
+# Constant 4-byte suffix appended after body_length in 8-byte trailer.
+_GW_BODY_TRAILER_SUFFIX = b"\x00\x00\x6d\x60"
+# 303-byte GW monitoring block (SAP gateway system-info exchange, field 0x0104).
+# Captured from a real A4H gateway; SM59 does not validate the content.
+_GW_MONITOR_BLOCK = bytes.fromhex(
+    "100402000c000187680000044c00000bb8"
+    "10040b0020ff7ffa0d78b737def6196e93"
+    "25bf1597ef73feebdb51fd91ce3c214400"
+    "0000001004040008001b00080012000810"
+    "040d00100000001b000000820000002800"
+    "0000821004160002000c10041900020000"
+    "10041e0008000002e90000041710042500"
+    "020001100409000338303010041d000231"
+    "3210041f001557696e646f77732031302e"
+    "30202832363130302920100420000f4945"
+    "20392e31312e32363130302e3010042100"
+    "084f6666696365203010042400080000053f"
+    "000007e51004280008000004ec000007e2"
+    "10042d0002000010041300450469c611e4"
+    "2d1b0b8fe10000000a141e0f0169c611e9"
+    "2d1b0b8fe10000000a141e0f0069c60fb6"
+    "2d1b0b91e10000000a141e0f0069c6a669"
+    "34be0bd4e10000000a141e4101"
 )
 
 # RFCSI structure field widths (SAP NW 7.52).  Total: 245 characters.
@@ -1131,6 +1179,16 @@ class SAPGatewayServerHandler(Loggeable, SAPNIServerHandler):
         # Defaults to "4103" (Unicode) so that catalog UC INTLEN values are
         # sent unchanged when we have not yet seen a GW_NORMAL_CLIENT.
         self._partner_codepage = "4103"
+        # Set to True when the connection was established via the
+        # GW_REMOTE_GATEWAY + F_ACCEPT_CONVERSATION gateway-to-gateway
+        # handshake.  F_SAP_SEND packets from such connections use a
+        # different header format (no codepage block at bytes 48-79) and
+        # a different login indicator (raw[50]==0x7d instead of EBCDIC RFC).
+        self._gw_connection = False
+        # IP of the gateway peer that sent F_ACCEPT_CONVERSATION.  Set in
+        # _handle_accept_conversation so that the back-connection thread can
+        # connect to client_ip:3300 after the 80-byte ACK is received.
+        self._gw_client_ip = None
         SAPNIServerHandler.__init__(self, request, client_address, server)
 
     # ------------------------------------------------------------------
@@ -1194,6 +1252,9 @@ class SAPGatewayServerHandler(Loggeable, SAPNIServerHandler):
             self.session.add_event("Dangerous gateway command attempted",
                                    data={"req_type": req_name})
 
+        elif req_type == 0x04:  # GW_REMOTE_GATEWAY
+            self._handle_remote_gateway(raw, req_name)
+
         elif req_type == 0x0b:  # GW_REGISTER_TP
             self.logger.debug("GW_REGISTER_TP from %s", str(self.client_address))
             self.session.add_event("TP registration request",
@@ -1220,6 +1281,184 @@ class SAPGatewayServerHandler(Loggeable, SAPNIServerHandler):
             self.request.send(response)
         except error:
             pass
+
+    def _handle_remote_gateway(self, raw, req_name):
+        """Handle GW_REMOTE_GATEWAY — gateway-to-gateway connection announcement.
+
+        A SAP gateway sends this 60-byte packet when connecting to a remote
+        gateway to establish a gateway-to-gateway link.  The layout is:
+
+            raw[0]    version (0x02)
+            raw[1]    req_type (0x04)
+            raw[2:6]  gateway IP address (4 bytes, big-endian)
+            raw[6:10] reserved (zeros)
+            raw[10:18] service name (NUL-terminated, e.g. "sapdp00")
+            raw[18:20] reserved
+            raw[20:24] codepage ("4103" = Unicode)
+            raw[24:30] reserved / sub-info (raw[29] = accept_info1)
+            raw[30:50] hostname (20 bytes, space-padded)
+            raw[50]   version/sub byte (0x06)
+            raw[51]   accept_info (CODE_PAGE=0x10, NIPING=0x20)
+            raw[52:60] trailing flags
+
+        The expected response mirrors GW_NORMAL_CLIENT: echo the packet back
+        with the CODE_PAGE (0x10) and NIPING (0x20) bits ORed into raw[51],
+        and raw[29] incremented by one — as observed in live A4H↔A4H traces.
+        After this handshake the connection carries normal APPC/RFC frames.
+        """
+        data = {"req_type": req_name}
+
+        if len(raw) >= 18:
+            try:
+                ip = ".".join(str(b) for b in raw[2:6])
+                if ip:
+                    data["gateway_ip"] = ip
+                service = raw[10:18].rstrip(b"\x00").decode("ascii",
+                                                             errors="replace").strip()
+                if service:
+                    data["service"] = service
+            except Exception:
+                pass
+
+        if len(raw) >= 24:
+            try:
+                cp = raw[20:24].decode("ascii").strip()
+                if cp:
+                    data["codepage"] = cp
+                    self._partner_codepage = cp
+            except (UnicodeDecodeError, AttributeError):
+                pass
+
+        if len(raw) >= 50:
+            try:
+                hostname = raw[30:50].rstrip(b" \x00").decode("ascii",
+                                                               errors="replace")
+                if hostname:
+                    data["hostname"] = hostname
+            except Exception:
+                pass
+
+        self.logger.debug("GW_REMOTE_GATEWAY from %s: ip=%s service=%s",
+                          str(self.client_address),
+                          data.get("gateway_ip"), data.get("service"))
+        self.session.add_event("Remote gateway connection", data=data)
+
+        # Echo back with CODE_PAGE (0x10) + NIPING (0x20) set in accept_info
+        # (raw[51]) and sub-info bit set in raw[29] — same bit pattern observed
+        # in A4H gateway-to-gateway traces.
+        try:
+            resp = bytearray(raw)
+            if len(resp) > 29:
+                resp[29] |= 0x01
+            if len(resp) > 51:
+                resp[51] |= 0x30
+            self.request.send(Raw(bytes(resp)))
+        except error:
+            pass
+
+    def _handle_accept_conversation(self, raw, func_name):
+        """Handle F_ACCEPT_CONVERSATION / GW_NORMAL_CLIENT-v6.
+
+        After the GW_REMOTE_GATEWAY handshake the connecting SAP gateway sends
+        raw[0]=0x06, raw[1]=0x03 carrying the CPIC routing parameters plus
+        connection stats and codepage info.
+
+        The real target SAP gateway responds with F_SAP_SEND (raw[1]=0xcb),
+        echoing back the CPIC routing block inside a modified header and
+        stripping out the connection stats/codepage bytes.  Without this
+        response the source SAP gateway hangs indefinitely waiting for a reply.
+
+        Packet layout (confirmed from A4H gateway-to-gateway pcap traces):
+          incoming bytes  0-39   fixed header (version, flags, conv state)
+          incoming bytes 40-47   conv_id (8 ASCII digits, e.g. "01630698")
+          incoming bytes 48-79   stats + codepage (stripped in response)
+          incoming bytes 80+     CPIC routing strings (null-terminated)
+                                 ends with "ENDOFSERVERINFO=1\\0"
+                                 followed by "\\x01WASABAP\\0" (ignored)
+
+        Response F_SAP_SEND layout:
+          bytes  0-39   fixed F_SAP_SEND header (raw[1]=0xcb)
+          bytes 40-47   conv_id (copied from incoming)
+          bytes 48-79   29 zero bytes + \\x06\\x00\\x03
+          bytes 80+     CPIC routing from incoming[80:ENDOFSERVERINFO+1]
+          last 8 bytes  \\x00\\x00\\x00\\xee\\x00\\x00\\x7d\\x00
+        """
+        self.logger.debug("F_ACCEPT_CONVERSATION from %s", str(self.client_address))
+
+        data = {"func_type": func_name}
+        try:
+            cpic_start = raw.find(b"CHECK_ONLY")
+            if cpic_start > 0:
+                cpic_raw = raw[cpic_start:]
+                for part in cpic_raw.split(b"\x00"):
+                    kv = part.split(b"=", 1)
+                    if len(kv) == 2:
+                        try:
+                            data[kv[0].decode("ascii")] = kv[1].decode("ascii")
+                        except UnicodeDecodeError:
+                            pass
+        except Exception:
+            pass
+
+        self._gw_connection = True
+        self._gw_client_ip = self.client_address[0]
+
+        # Detect whether this F_ACCEPT_CONVERSATION contains an embedded RFC
+        # login (SM59 connection test) or is a pure gateway routing packet.
+        # The EBCDIC "RFC" marker (0xd9 0xc6 0xc3) appears at the start of
+        # the CPIC body in the SM59 case.
+        ebcdic_rfc = b"\xd9\xc6\xc3"
+        has_rfc_login = ebcdic_rfc in raw
+
+        if has_rfc_login:
+            # SM59 connection test: the packet carries a full RFC login
+            # (credentials + RFC_PING invocation).  Extract the credentials
+            # and respond with a proper login-success F_SAP_SEND so that SAP
+            # proceeds to call RFC_GET_FUNCTION_INTERFACE / DDIF_FIELDINFO_GET.
+            # Those exchanges complete the RFC_PING handshake; SAP then sends
+            # the 80-byte ACK which triggers our NIPING back-connection.
+            data["login_type"] = "sm59_rfc"
+            self._extract_login_fields(raw, data)
+            self.logger.info(
+                "SM59 RFC login via gateway from %s: user=%s client=%s password=%s",
+                str(self.client_address),
+                data.get("username", "N/A"),
+                data.get("client_number", "N/A"),
+                data.get("password", "N/A"),
+            )
+            self.session.add_event("Gateway system info received", data=data)
+            try:
+                self._send_login_response(raw, data)
+            except error:
+                pass
+        else:
+            # Pure gateway routing packet (no embedded RFC login).
+            # Echo the routing body back so the source gateway proceeds.
+            self.session.add_event("Gateway system info received", data=data)
+            _F_SAP_SEND_HDR = bytes([
+                0x06, 0xcb, 0x02, 0x00, 0x03, 0xcf, 0x00, 0x02,  # bytes  0-7
+                0x00, 0x00, 0x80, 0x00, 0x00, 0x01, 0x00, 0x00,  # bytes  8-15
+                0x00, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00,  # bytes 16-23
+                0x00, 0x01, 0x00, 0x08, 0x00, 0x00, 0x85, 0x0c,  # bytes 24-31
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # bytes 32-39
+            ])
+            _F_SAP_SEND_MID = b"\x00" * 29 + b"\x06\x00\x03"    # bytes 48-79
+            _F_SAP_SEND_TAIL = b"\x00\x00\x00\xee\x00\x00\x7d\x00"
+            try:
+                conv_id = raw[40:48] if len(raw) >= 48 else b"\x00" * 8
+                routing = b""
+                if len(raw) > 80:
+                    routing_raw = raw[80:]
+                    marker = b"ENDOFSERVERINFO=1\x00"
+                    idx = routing_raw.find(marker)
+                    if idx >= 0:
+                        routing = routing_raw[:idx + len(marker)]
+                    else:
+                        routing = routing_raw
+                payload = _F_SAP_SEND_HDR + conv_id + _F_SAP_SEND_MID + routing + _F_SAP_SEND_TAIL
+                self.request.send(Raw(bytes(payload)))
+            except error:
+                pass
 
     def _handle_normal_client(self, raw, version, req_name):
         """Handle GW_NORMAL_CLIENT — first packet in an RFC connection.
@@ -1328,6 +1567,9 @@ class SAPGatewayServerHandler(Loggeable, SAPNIServerHandler):
 
         if func_type == 0x01:  # F_INITIALIZE_CONVERSATION
             self._handle_init_conversation(raw, func_name)
+
+        elif func_type == 0x03:  # F_ACCEPT_CONVERSATION / GW_NORMAL_CLIENT-v6
+            self._handle_accept_conversation(raw, func_name)
 
         elif func_type == 0x0f:  # F_SET_PARTNER_LU_NAME
             self.logger.debug("F_SET_PARTNER_LU_NAME from %s",
@@ -1521,10 +1763,45 @@ class SAPGatewayServerHandler(Loggeable, SAPNIServerHandler):
                 data["conversation_id"] = conv_id
 
         # Determine whether this is the login handshake (first F_SAP_SEND)
-        # or an actual RFC function call.  The login packet contains the
-        # EBCDIC "RFC" marker (0xD9 0xC6 0xC3).
+        # or an actual RFC function call.
+        #
+        # Direct NWRFC clients signal the login with an EBCDIC "RFC" marker
+        # (0xD9 0xC6 0xC3) near the start of the body.
+        #
+        # Gateway-to-gateway connections (_gw_connection=True) use a different
+        # format: the login F_SAP_SEND has raw[50] == 0x7d (observed in every
+        # A4H gateway-to-gateway pcap trace).  There is no EBCDIC RFC marker.
         ebcdic_rfc = b"\xd9\xc6\xc3"  # EBCDIC for "RFC"
-        is_login = ebcdic_rfc in raw
+        if self._gw_connection:
+            # Gateway-to-gateway login has raw[50]==0x7d (routing-block marker).
+            data["gw_bytes48_56"] = (raw[48:56].hex() if len(raw) >= 56 else raw[48:].hex())
+            data["gw_pktlen"] = len(raw)
+            if len(raw) == 80 and self._gw_client_ip:
+                # 80-byte header-only F_SAP_SEND = gateway "ACK" after our
+                # F_SAP_SEND response.  The SAP is now waiting for us to
+                # open a back-connection to client_ip:3300.  Don't respond
+                # on this channel — just spawn the back-connection thread.
+                self.session.add_event("Gateway ACK received, initiating back-connection",
+                                       data=data)
+                self._initiate_back_connection(self._gw_client_ip)
+                return
+            elif self.server.clients.get(self.client_address):
+                # Client already logged in — this is a post-login RFC call
+                # (e.g. RFC_PING from SM59 connection test).  Route to RFC
+                # dispatch below; don't re-send login response.
+                is_login = False
+            elif len(raw) > 50 and raw[50] == 0x7d:
+                is_login = True
+            else:
+                # Pre-login Diag-type F_SAP_SEND — acknowledge with F_RECEIVE.
+                self.session.add_event("RFC function call", data=data)
+                try:
+                    self._send_gw_receive(raw)
+                except error:
+                    pass
+                return
+        else:
+            is_login = ebcdic_rfc in raw
 
         client = self.server.clients.get(self.client_address)
 
@@ -1849,11 +2126,57 @@ class SAPGatewayServerHandler(Loggeable, SAPNIServerHandler):
 
         return bytes(resp)
 
-    def _build_login_body(self, username, client_nbr, language="E"):
+    def _build_gw_func_result(self, program="SAPLSRFC", session_id=None):
+        """Build the GW function-result TLV block (used in both INIT_ACCEPT and
+        post-login RFC responses).
+
+        Structure derived from A4H-A4H SM59 pcap (Frame 6 / Frame 3 func section):
+          _tlv(0x0500, 0x0336, RC=1)   ← function return-code indicator
+          _tlv(0x0336, 0x0503, "")
+          _tlv(0x0503, 0x0514, seed)   ← must echo the UUID from the incoming packet
+          _tlv(0x0514, 0x0420, auth)
+          _tlv(0x0420, 0x5001, cpic_state)
+          _tlv(0x5001, 0x0130, program)
+          _tlv(0x0130, 0x0667, float)
+          _tlv(0x0667, 0x0104, gw_monitor_block)
+          _tlv(0x0104, 0xffff, "")  + b"\\xff\\xff"
+
+        *session_id* must be the 16-byte UUID extracted from the incoming packet
+        (via _extract_session_id).  SAP validates that the partner echoes the
+        exact same UUID it assigned; a mismatch causes RSRFCPIN to abort with
+        "UUID received from partner does not match."
+        """
+        def utf16(s):
+            return s.encode("utf-16-le")
+
+        uuid_bytes = session_id if (session_id and len(session_id) == 16) else os.urandom(16)
+
+        fields = b""
+        fields += _tlv(0x0500, 0x0336, b"\x00\x00\x00\x01")
+        fields += _tlv(0x0336, 0x0503, b"")
+        fields += _tlv(0x0503, 0x0514, uuid_bytes)
+        fields += _tlv(0x0514, 0x0420, b"\x00\x00\x00\x00")
+        fields += _tlv(0x0420, 0x5001, _GW_5001_DATA)
+        fields += _tlv(0x5001, 0x0130, utf16(program.ljust(40)))
+        fields += _tlv(0x0130, 0x0667, _GW_0667_FLOAT)
+        fields += _tlv(0x0667, 0x0104, _GW_MONITOR_BLOCK)
+        fields += _tlv(0x0104, 0xffff, b"") + b"\xff\xff"
+        return fields
+
+    def _build_login_body(self, username, client_nbr, language="E", gw=False, session_id=None):
         """Build the TLV body for a successful login response.
 
         Mimics a real SAP server by sending back server info (hostname, SID,
-        kernel version) and echoing the client's credentials.
+        kernel version) and the function result for the embedded RFC call.
+
+        When *gw* is True the body follows the gateway-to-gateway INIT_ACCEPT
+        format observed in a real A4H-A4H SM59 capture:
+          • GW CPIC header variant (bytes 4/32 differ from direct-RFC header)
+          • No credential echo (0x0150/0x0151/0x0152 TLVs absent)
+          • Program = SAPLSRFC (not SAPLSYST)
+          • Function result uses 0x0500→0x0336 return-code + GW 0x0104 block
+          • 8-byte body trailer appended: [body_len:4 BE][0x00006d60]
+          • session_id echoes the 16-byte UUID from the incoming packet
         """
         def utf16(s):
             return s.encode("utf-16-le")
@@ -1861,67 +2184,274 @@ class SAPGatewayServerHandler(Loggeable, SAPNIServerHandler):
         server_ip = self.server.server_address[0] or "127.0.0.1"
         host_sid = "%s_%s_%s" % (self.hostname, self.sid, self.instance_number)
         kver = self.kernel_version[:3].ljust(4)
-        user_padded = (username or "").ljust(12)[:12]
-        cli = (client_nbr or "000")[:3]
         short_host = self.hostname + "_"
 
-        fields = b""
-        fields += _tlv(0x0106, 0x0016, utf16("4103"))
-        fields += _tlv(0x0016, 0x0007, utf16(server_ip.ljust(15)))
-        fields += _tlv(0x0007, 0x0018, utf16(server_ip))
-        fields += _tlv(0x0018, 0x0008, utf16(host_sid[:15].ljust(15)))
-        fields += _tlv(0x0008, 0x0011, utf16("3"))
-        fields += _tlv(0x0011, 0x0013, utf16(kver))
-        fields += _tlv(0x0013, 0x0012, utf16(kver))
-        fields += _tlv(0x0012, 0x0006, utf16(short_host))
-        fields += _tlv(0x0006, 0x0130, utf16("SAPLSYST"))
-        fields += _tlv(0x0130, 0x0150, utf16(user_padded))
-        fields += _tlv(0x0150, 0x0151, utf16(cli))
-        fields += _tlv(0x0151, 0x0152, utf16(language or "E"))
-        fields += _tlv(0x0152, 0x0500, b"")
-        fields += _tlv(0x0500, 0x0503, b"")
-        fields += _tlv(0x0503, 0x0514, os.urandom(16))
-        fields += _tlv(0x0514, 0x0420, b"\x00\x00\x00\x00")
-        fields += _tlv(0x0420, 0x0512, b"")
-        fields += _tlv(0x0512, 0x0130, utf16("SAPLSYST".ljust(40)))
-        fields += _tlv(0x0130, 0x0667, b"\x00\x00\x00\x00\x00\xe0\x60\x40")
-        # End markers
-        fields += _tlv(0x0667, 0xffff, b"") + b"\xff\xff"
+        # Server-info TLV chain (common prefix for both modes)
+        info = b""
+        info += _tlv(0x0106, 0x0016, utf16("4103"))
+        info += _tlv(0x0016, 0x0007, utf16(server_ip.ljust(15)))
+        info += _tlv(0x0007, 0x0018, utf16(server_ip))
+        info += _tlv(0x0018, 0x0008, utf16(host_sid[:15].ljust(15)))
+        info += _tlv(0x0008, 0x0011, utf16("3"))
+        info += _tlv(0x0011, 0x0013, utf16(kver))
+        info += _tlv(0x0013, 0x0012, utf16(kver))
+        info += _tlv(0x0012, 0x0006, utf16(short_host))
 
-        return _CPIC_HEADER + fields
+        if gw:
+            # GW INIT_ACCEPT: program=SAPLSRFC, no credential echo,
+            # then the embedded RFC_PING function result.
+            info += _tlv(0x0006, 0x0130, utf16("SAPLSRFC"))
+            info += _tlv(0x0130, 0x0500, b"")
+            fields = info + self._build_gw_func_result("SAPLSRFC", session_id=session_id)
+            body = _CPIC_HEADER_GW + fields
+            trailer = struct.pack(">I", len(body)) + _GW_BODY_TRAILER_SUFFIX
+            return body + trailer
+        else:
+            # Direct-RFC login: echo credentials and use simple function result.
+            user_padded = (username or "").ljust(12)[:12]
+            cli = (client_nbr or "000")[:3]
+            info += _tlv(0x0006, 0x0130, utf16("SAPLSYST"))
+            info += _tlv(0x0130, 0x0150, utf16(user_padded))
+            info += _tlv(0x0150, 0x0151, utf16(cli))
+            info += _tlv(0x0151, 0x0152, utf16(language or "E"))
+            info += _tlv(0x0152, 0x0500, b"")
+            func = b""
+            func += _tlv(0x0500, 0x0503, b"")
+            func += _tlv(0x0503, 0x0514, os.urandom(16))
+            func += _tlv(0x0514, 0x0420, b"\x00\x00\x00\x00")
+            func += _tlv(0x0420, 0x0512, b"")
+            func += _tlv(0x0512, 0x0130, utf16("SAPLSYST".ljust(40)))
+            func += _tlv(0x0130, 0x0667, b"\x00\x00\x00\x00\x00\xe0\x60\x40")
+            func += _tlv(0x0667, 0xffff, b"") + b"\xff\xff"
+            return _CPIC_HEADER + info + func
 
-    def _build_rfc_body(self, program="SAPLSRFC"):
-        """Build a minimal TLV body for an RFC function response."""
+    def _build_rfc_body(self, program="SAPLSRFC", gw=False, session_id=None):
+        """Build a TLV body for an RFC function response.
+
+        When *gw* is True the body uses the gateway-to-gateway format with the
+        0x0500→0x0336 return-code TLV, the 0x0104 GW monitoring block, and an
+        8-byte body-length trailer (matches real A4H-A4H SM59 pcap Frame 6).
+        *session_id* is the 16-byte UUID extracted from the incoming packet and
+        must be echoed back so SAP does not abort with a UUID mismatch error.
+        """
         def utf16(s):
             return s.encode("utf-16-le")
 
-        fields = b""
-        fields += _tlv(0x0500, 0x0503, b"")  # fake prev for first field
-        fields += _tlv(0x0503, 0x0514, os.urandom(16))
-        fields += _tlv(0x0514, 0x0420, b"\x00\x00\x00\x00")
-        fields += _tlv(0x0420, 0x0512, b"")
-        fields += _tlv(0x0512, 0x0130, utf16(program.ljust(40)))
-        fields += _tlv(0x0130, 0x0667, b"\x00\x00\x00\x00\x00\x00\x57\x40")
-        fields += _tlv(0x0667, 0xffff, b"") + b"\xff\xff"
+        preamble = b"\x05\x00\x00\x00"
 
-        # 4-byte preamble before TLV fields (matches real server)
-        cpic_hdr = b"\x05\x00\x00\x00"
-        return cpic_hdr + fields
+        if gw:
+            fields = self._build_gw_func_result(program, session_id=session_id)
+            body = preamble + fields
+            trailer = struct.pack(">I", len(body)) + _GW_BODY_TRAILER_SUFFIX
+            return body + trailer
+        else:
+            fields = b""
+            fields += _tlv(0x0500, 0x0503, b"")
+            fields += _tlv(0x0503, 0x0514, os.urandom(16))
+            fields += _tlv(0x0514, 0x0420, b"\x00\x00\x00\x00")
+            fields += _tlv(0x0420, 0x0512, b"")
+            fields += _tlv(0x0512, 0x0130, utf16(program.ljust(40)))
+            fields += _tlv(0x0130, 0x0667, b"\x00\x00\x00\x00\x00\x00\x57\x40")
+            fields += _tlv(0x0667, 0xffff, b"") + b"\xff\xff"
+            return preamble + fields
 
     def _send_login_response(self, raw, data):
         """Send a login success response with full TLV body."""
+        session_id = _extract_session_id(raw) if self._gw_connection else None
         body = self._build_login_body(
             data.get("username", ""),
             data.get("client_number", "000"),
+            gw=self._gw_connection,
+            session_id=session_id,
         )
-        header = self._build_appc_header(raw, len(body))
-        self.request.send(Raw(header + body))
+        if self._gw_connection:
+            # GW INIT_ACCEPT uses byte 30 = 0x85 (same as all other GW responses)
+            self.request.send(Raw(self._build_gw_sap_send_hdr(raw, is_login_resp=False) + body))
+        else:
+            header = self._build_appc_header(raw, len(body))
+            self.request.send(Raw(header + body))
 
     def _send_rfc_response(self, raw):
         """Send a minimal RFC function response."""
-        body = self._build_rfc_body()
-        header = self._build_appc_header(raw, len(body))
-        self.request.send(Raw(header + body))
+        session_id = _extract_session_id(raw) if self._gw_connection else None
+        body = self._build_rfc_body(gw=self._gw_connection, session_id=session_id)
+        if self._gw_connection:
+            self.request.send(Raw(self._build_gw_sap_send_hdr(raw, is_login_resp=False) + body))
+        else:
+            header = self._build_appc_header(raw, len(body))
+            self.request.send(Raw(header + body))
+
+    def _build_gw_sap_send_hdr(self, raw, is_login_resp=False):
+        """Build the 80-byte gateway-format F_SAP_SEND response header.
+
+        In gateway-to-gateway connections all F_SAP_SEND responses use this
+        format instead of the APPC/codepage block used by _build_appc_header.
+
+        Bytes  0-39: F_SAP_SEND base header (byte 30 = 0xc5 for login
+                     response, 0x85 for all other responses).
+        Bytes 40-47: conv_id copied from the incoming packet.
+        Bytes 48-79: 29 zero bytes + \\x06\\x00\\x03  (gateway routing block).
+
+        The body is appended immediately after these 80 bytes.  Because the
+        NI 4-byte length prefix already encodes the total payload size the SAP
+        gateway infers the body length from (NI_len - 80) rather than reading
+        it from bytes 48-79 as the APPC codepage block does.
+        """
+        resp = bytearray(80)
+        # bytes 0-39: fixed F_SAP_SEND header fields
+        resp[0]  = 0x06  # version / APPC marker
+        resp[1]  = 0xcb  # func_type F_SAP_SEND
+        resp[2]  = 0x02
+        resp[4]  = 0x03
+        resp[5]  = 0xcf  # connection sub-type (constant across observed traces)
+        resp[7]  = 0x02
+        resp[10] = 0x80
+        resp[13] = 0x01
+        resp[17] = 0xff
+        resp[18] = 0xff
+        resp[19] = 0xff
+        resp[20] = 0xff
+        resp[25] = 0x01
+        resp[27] = 0x08
+        # byte 30 encodes packet role: 0xc5 = login response, 0x85 = other
+        resp[30] = 0xc5 if is_login_resp else 0x85
+        resp[31] = 0x0c
+        # bytes 40-47: conv_id from incoming packet
+        if len(raw) >= 48:
+            resp[40:48] = raw[40:48]
+        # bytes 48-79: 29 zero bytes + \x06\x00\x03  (gateway routing marker)
+        resp[77] = 0x06
+        # bytes 78-79 already 0x00 0x03 from bytearray init (zero) → set 79=0x03
+        resp[79] = 0x03
+        return bytes(resp)
+
+    def _send_gw_receive(self, raw):
+        """Send an F_RECEIVE (func_type=0x09) response for gateway Diag packets.
+
+        Gateway Diag-type F_SAP_SEND packets (raw[50] != 0x7d) must be answered
+        with a bare 80-byte F_RECEIVE header — no body.  This is the format
+        observed in pcap frame 20 of the a4h-a4h gateway capture.
+
+        Bytes  0-39: F_RECEIVE base header (func_type=0x09, byte 30=0x41).
+        Bytes 40-47: conv_id copied from incoming packet.
+        Bytes 48-79: \\x00\\x00\\x7d\\x00 + 25 zero bytes + \\x06\\x00\\x03.
+        """
+        resp = bytearray(80)
+        # bytes 0-39: F_RECEIVE header
+        resp[0]  = 0x06  # version / APPC marker
+        resp[1]  = 0x09  # func_type F_RECEIVE
+        resp[2]  = 0x02
+        resp[4]  = 0x03
+        resp[5]  = 0xcf
+        resp[7]  = 0x02
+        resp[10] = 0x80
+        resp[17] = 0xff
+        resp[18] = 0xff
+        resp[19] = 0xff
+        resp[20] = 0xff
+        resp[25] = 0x01
+        resp[30] = 0x41
+        # bytes 40-47: conv_id from incoming packet
+        if len(raw) >= 48:
+            resp[40:48] = raw[40:48]
+        # bytes 48-51: \x00\x00\x7d\x00
+        resp[50] = 0x7d
+        # bytes 52-76: zeros (already zero)
+        # bytes 77-79: \x06\x00\x03
+        resp[77] = 0x06
+        resp[79] = 0x03
+        self.request.send(Raw(bytes(resp)))
+
+    # -- Gateway back-connection -------------------------------------------
+
+    def _initiate_back_connection(self, client_ip):
+        """Spawn a daemon thread to perform the NIPING back-connection.
+
+        After the SM59 connection test's RFC_PING call completes (signalled by
+        the 80-byte F_SAP_SEND ACK), the gateway must connect back to the
+        initiator's port 3300 and exchange a NIPING handshake.
+        """
+        import threading
+        t = threading.Thread(
+            target=self._back_connection_worker,
+            args=(client_ip,),
+            daemon=True,
+            name="gw-back-{}".format(client_ip),
+        )
+        t.start()
+
+    def _back_connection_worker(self, client_ip):
+        """Worker: perform NIPING back-connection to client_ip:3300.
+
+        After the SM59 connection test's RFC_PING call completes (signalled by
+        the 80-byte F_SAP_SEND ACK on the inbound connection), the real SAP
+        gateway opens a second TCP connection back to the initiator's gateway
+        port and exchanges a NIPING handshake.  Without this exchange SM59
+        hangs until its 5-minute timeout fires.
+
+        Protocol (from pcap a4h-a4h_rfc_connection_test.pcapng frames 16-20):
+          1. TCP connect to client_ip:3300
+          2. Send   NI_PING\x00  (NI frame: 4-byte len=8 + 8-byte payload)
+          3. Receive NI_PING\x00 echo from server
+          4. Send   NI_PONG\x00  (NI frame: 4-byte len=8 + 8-byte payload)
+          5. Receive NI_PONG\x00 echo from server
+          6. Close TCP connection
+        """
+        import socket as _socket
+        import struct
+
+        GW_PORT = 3300
+        NI_PING = struct.pack('>I', 8) + b"NI_PING\x00"
+
+        def _recv_exact(sock, n, timeout=5.0):
+            sock.settimeout(timeout)
+            buf = b""
+            try:
+                while len(buf) < n:
+                    chunk = sock.recv(n - len(buf))
+                    if not chunk:
+                        return None
+                    buf += chunk
+            except Exception:
+                return None
+            return buf
+
+        sock = None
+        try:
+            sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+            sock.settimeout(10.0)
+            sock.connect((client_ip, GW_PORT))
+
+            # Send NI_PING; real SAP gateway responds with NI_PONG (not echo).
+            sock.sendall(NI_PING)
+            pong = _recv_exact(sock, 12)
+
+            self.session.add_event(
+                "Gateway NIPING back-connection complete",
+                data={
+                    "back_to": client_ip,
+                    "response": pong.hex() if pong else None,
+                },
+            )
+
+            # NIPING only — the back-connection is purely a reachability check.
+            # Real SAP gateways close the back-connection immediately after
+            # receiving NI_PONG (confirmed from a4h-a4h_rfc_connection_test.pcapng).
+            # Do NOT send any additional data (e.g. GW_REMOTE_GATEWAY) here;
+            # doing so confuses SAP's gateway and causes an ABAP Runtime Error.
+
+        except Exception as exc:
+            self.logger.debug(
+                "Gateway back-connection to %s:%d failed: %s",
+                client_ip, GW_PORT, exc,
+            )
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
 
     # -- RFC_SYSTEM_INFO support -------------------------------------------
 
@@ -2205,15 +2735,21 @@ class SAPGatewayServerHandler(Loggeable, SAPNIServerHandler):
                 body = self._build_rfcgfi_body(session_id, func_info)
             else:
                 body = self._build_rfc_body()
-        header = self._build_appc_header(raw, len(body))
-        self.request.send(Raw(header + body))
+        if self._gw_connection:
+            self.request.send(Raw(self._build_gw_sap_send_hdr(raw) + body))
+        else:
+            header = self._build_appc_header(raw, len(body))
+            self.request.send(Raw(header + body))
 
     def _send_sysinfo_response(self, raw):
         """Send RFC_SYSTEM_INFO response with system data."""
         session_id = _extract_session_id(raw)
         body = self._build_sysinfo_response_body(session_id)
-        header = self._build_appc_header(raw, len(body))
-        self.request.send(Raw(header + body))
+        if self._gw_connection:
+            self.request.send(Raw(self._build_gw_sap_send_hdr(raw) + body))
+        else:
+            header = self._build_appc_header(raw, len(body))
+            self.request.send(Raw(header + body))
 
     def _extract_ddif_tabname(self, raw):
         """Extract the TABNAME import parameter from a DDIF_FIELDINFO_GET request.
@@ -2578,8 +3114,11 @@ class SAPGatewayServerHandler(Loggeable, SAPNIServerHandler):
                     tabname or "?", tabname_call_num,
                 )
 
-        header = self._build_appc_header(raw, len(body))
-        self.request.send(Raw(header + body))
+        if self._gw_connection:
+            self.request.send(Raw(self._build_gw_sap_send_hdr(raw) + body))
+        else:
+            header = self._build_appc_header(raw, len(body))
+            self.request.send(Raw(header + body))
 
     # -- Old-style init (F_SAP_INIT 0xca / F_SAP_ALLOCATE 0xc9) ---------
 
